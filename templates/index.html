@@ -1,26 +1,40 @@
-<!DOCTYPE html>
-<html>
-<head>
-  <title>EchoEdge</title>
-  <link rel="stylesheet" href="/static/style.css">
-</head>
-<body>
-  <h1>EchoEdge</h1>
+<!-- ... all your HTML content above ... -->
 
-  <div class="card">
-    <h2>Voice Control Laptop</h2>
-    <p>Owner only — press & speak to run a command (example: "open calculator")</p>
-    <button id="record-control">Hold & Speak</button>
-    <div id="control-result"></div>
-  </div>
+<!-- 🔽 paste this before the closing </body> -->
+<script>
+async function recordAudio(seconds = 4) {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    alert("Microphone not supported in this browser");
+    return null;
+  }
 
-  <div class="card">
-    <h2>Voice → Text</h2>
-    <p>Transcribe speech to text</p>
-    <button id="record-transcribe">Hold & Speak</button>
-    <div id="transcription"></div>
-  </div>
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  const recorder = new MediaRecorder(stream);
+  const chunks = [];
 
-  <script src="/static/main.js"></script>
+  recorder.ondataavailable = e => chunks.push(e.data);
+  recorder.start();
+
+  await new Promise(res => setTimeout(res, seconds * 1000));
+  recorder.stop();
+
+  await new Promise(res => (recorder.onstop = res));
+  stream.getTracks().forEach(t => t.stop());
+
+  const blob = new Blob(chunks, { type: "audio/webm" });
+  const fd = new FormData();
+  fd.append("file", blob, "voice.webm");
+  return fd;
+}
+
+// Example usage:
+async function enrollOwner() {
+  const fd = await recordAudio(6);
+  if (!fd) return;
+  const res = await fetch("/api/enroll_owner", { method: "POST", body: fd });
+  const data = await res.json();
+  alert(data.message || "Done");
+}
+</script>
 </body>
 </html>
