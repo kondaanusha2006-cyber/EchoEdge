@@ -1,6 +1,5 @@
 """
-gui_main.py
-EchoEdge Desktop (dark fullscreen GUI)
+EchoEdge Web App (Flask version)
 
 Features:
 - Home: Voice Control (owner-only) + Voice->Text (copyable)
@@ -12,10 +11,6 @@ Features:
 
 import os
 import threading
-import tkinter as tk
-from tkinter import messagebox, filedialog
-from tkinter import ttk
-import tkinter.scrolledtext as scrolledtext
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
@@ -25,7 +20,11 @@ import whisper
 import webbrowser
 import subprocess
 from scipy.spatial.distance import cosine
-import pyperclip  # ensure installed: pip install pyperclip
+import json
+import base64
+from io import BytesIO
+
+from flask import Flask, render_template, request, jsonify, send_file
 
 # ---------------- CONFIG ----------------
 SAMPLERATE = 16000
@@ -154,281 +153,702 @@ def execute_action_from_text(text):
                 return False, str(e)
     return False, None
 
-# ------------- UI and app state -------------
+# ------------- App state -------------
 app_state = {
     "threshold": SIMILARITY_THRESHOLD,
     "energy_threshold": ENERGY_THRESHOLD,
     "status": "Idle"
 }
 
-# Utility: thread wrapper to avoid blocking UI
-def run_in_thread(fn):
-    def wrapper(*a, **k):
-        threading.Thread(target=lambda: fn(*a, **k), daemon=True).start()
-    return wrapper
+# ------------- Flask App -------------
+app = Flask(__name__)
 
-# ------------- GUI -------------
-class EchoEdgeGUI:
-    def __init__(self, root):
-        self.root = root
-        root.title("EchoEdge")
-        root.attributes("-fullscreen", True)  # fullscreen
-        root.configure(bg="#0b0f14")  # dark background
+@app.route('/')
+def home():
+    return render_template('index.html', 
+                         app_state=app_state,
+                         owner_enrolled=os.path.exists(EMBED_PATH))
 
-        # top header
-        header = tk.Frame(root, bg="#0b0f14")
-        header.pack(fill="x", pady=12)
-        title = tk.Label(header, text="EchoEdge", font=("Helvetica", 30, "bold"), fg="white", bg="#0b0f14")
-        title.pack()
-
-        # main frame for pages
-        self.page_frame = tk.Frame(root, bg="#0b0f14")
-        self.page_frame.pack(expand=True, fill="both")
-
-        # bottom nav
-        nav = tk.Frame(root, bg="#081018", height=60)
-        nav.pack(fill="x")
-        btn_home = tk.Button(nav, text="Home", command=self.show_home, bg="#1b2630", fg="white", width=12, height=2)
-        btn_home.pack(side="left", padx=12, pady=8)
-        btn_settings = tk.Button(nav, text="Settings", command=self.show_settings, bg="#1b2630", fg="white", width=12, height=2)
-        btn_settings.pack(side="left", padx=12, pady=8)
-        btn_quit = tk.Button(nav, text="Quit", command=self.on_quit, bg="#6b2222", fg="white", width=10, height=2)
-        btn_quit.pack(side="right", padx=12, pady=8)
-
-        # status bar
-        self.status_var = tk.StringVar(value="Idle")
-        status_bar = tk.Label(root, textvariable=self.status_var, anchor="w", bg="#061018", fg="#bfcbd6")
-        status_bar.pack(fill="x")
-
-        # pages
-        self.home_page = None
-        self.settings_page = None
-        self.voice_text_page = None
-
-        self.show_home()
-
-    def set_status(self, txt):
-        app_state["status"] = txt
-        self.status_var.set(txt)
-        self.root.update_idletasks()
-
-    def clear_page(self):
-        for w in self.page_frame.winfo_children():
-            w.destroy()
-
-    def show_home(self):
-        self.clear_page()
-        f = tk.Frame(self.page_frame, bg="#0b0f14")
-        f.pack(expand=True, fill="both")
-
-        # two big tiles
-        tile_frame = tk.Frame(f, bg="#0b0f14")
-        tile_frame.pack(expand=True)
-
-        btn_voice = tk.Button(tile_frame, text="🎙 Voice Control Laptop", font=("Arial", 24),
-                              bg="#242a33", fg="white", width=28, height=6, command=self.on_voice_control)
-        btn_voice.grid(row=0, column=0, padx=40, pady=40)
-
-        btn_v2t = tk.Button(tile_frame, text="🔤 Voice → Text", font=("Arial", 24),
-                              bg="#242a33", fg="white", width=28, height=6, command=self.on_voice_to_text_page)
-        btn_v2t.grid(row=0, column=1, padx=40, pady=40)
-
-        self.home_page = f
-
-    def show_settings(self):
-        self.clear_page()
-        f = tk.Frame(self.page_frame, bg="#0b0f14")
-        f.pack(expand=True, fill="both", padx=40, pady=20)
-
-        # Enrollment group
-        g = tk.LabelFrame(f, text="Owner Voice (Enrollment)", fg="white", bg="#0b0f14", labelanchor="n")
-        g.pack(fill="x", pady=8)
-        g.configure(font=("Arial",12))
-        enroll_btn = tk.Button(g, text="Enroll / Replace Owner", command=self.on_enroll_replace, bg="#2b6b33", fg="white")
-        enroll_btn.pack(side="left", padx=8, pady=8)
-        delete_btn = tk.Button(g, text="Delete Owner", command=self.on_delete_owner, bg="#6b2222", fg="white")
-        delete_btn.pack(side="left", padx=8, pady=8)
-
-        # Threshold group
-        thrf = tk.LabelFrame(f, text="Verification Settings", fg="white", bg="#0b0f14", labelanchor="n")
-        thrf.pack(fill="x", pady=8)
-        tk.Label(thrf, text="Similarity threshold (0.5 - 0.99):", bg="#0b0f14", fg="white").pack(side="left", padx=6)
-        self.thresh_var = tk.DoubleVar(value=app_state["threshold"])
-        thr_entry = tk.Entry(thrf, textvariable=self.thresh_var, width=8)
-        thr_entry.pack(side="left", padx=6)
-        apply_thresh = tk.Button(thrf, text="Apply", command=self.on_apply_threshold, bg="#2b6b33", fg="white")
-        apply_thresh.pack(side="left", padx=6)
-
-        # Energy sensitivity
-        tk.Label(thrf, text="  Energy sensitivity (lower = more sensitive):", bg="#0b0f14", fg="white").pack(side="left", padx=6)
-        self.energy_var = tk.DoubleVar(value=app_state["energy_threshold"])
-        energy_entry = tk.Entry(thrf, textvariable=self.energy_var, width=8)
-        energy_entry.pack(side="left", padx=6)
-        apply_energy = tk.Button(thrf, text="Apply", command=self.on_apply_energy, bg="#2b6b33", fg="white")
-        apply_energy.pack(side="left", padx=6)
-
-        # info
-        info = tk.Label(f, text="Notes: Enroll voice in quiet place. If verification fails, increase recording length in enroll step.", bg="#0b0f14", fg="#bfcbd6")
-        info.pack(pady=10)
-
-        self.settings_page = f
-
-    def on_quit(self):
-        if messagebox.askyesno("Quit", "Exit EchoEdge?"):
-            self.root.destroy()
-
-    # ------------- Actions that run long should be threaded -------------
-    @run_in_thread
-    def on_enroll_replace(self):
-        try:
-            self.set_status("Recording owner voice (6s)...")
-            enroll_owner_record(duration=6.0)
-            self.set_status("Owner enrolled (saved owner_embedding.npy).")
-            messagebox.showinfo("Enroll", "Owner enrolled and saved.")
-        except Exception as e:
-            messagebox.showerror("Enroll error", str(e))
-            self.set_status("Idle")
-
-    @run_in_thread
-    def on_delete_owner(self):
-        if not os.path.exists(EMBED_PATH):
-            messagebox.showinfo("Delete", "No owner enrolled.")
-            return
-        if messagebox.askyesno("Delete", "Delete owner embedding and voice?"):
-            delete_owner_embedding()
-            self.set_status("Owner deleted.")
-            messagebox.showinfo("Delete", "Owner data deleted.")
-
-    def on_apply_threshold(self):
-        try:
-            v = float(self.thresh_var.get())
-            if not (0.5 <= v <= 0.99):
-                raise ValueError("threshold out of range")
-            app_state["threshold"] = v
-            messagebox.showinfo("Threshold", f"Threshold set to {v:.2f}")
-        except Exception as e:
-            messagebox.showerror("Threshold error", str(e))
-
-    def on_apply_energy(self):
-        try:
-            v = float(self.energy_var.get())
-            app_state["energy_threshold"] = v
-            messagebox.showinfo("Energy", f"Energy sensitivity set to {v:.6f}")
-        except Exception as e:
-            messagebox.showerror("Energy error", str(e))
-
-    @run_in_thread
-    def on_voice_control(self):
-        try:
-            self.set_status("Verifying owner voice...")
-            ok, sim = verify_owner_once(duration=VERIFY_SECONDS)
-            if sim is None:
-                messagebox.showwarning("Verify", "No owner enrolled or audio too quiet.")
-                self.set_status("Idle")
-                return
-            self.set_status(f"Similarity = {sim:.3f}")
-            if not ok:
-                messagebox.showwarning("Access Denied", f"Not owner (similarity={sim:.3f})")
-                self.set_status("Idle")
-                return
-
-            # owner verified -> record command
-            self.set_status("Owner verified: recording command...")
-            cmd_file = "gui_command.wav"
-            record_to_file(cmd_file, COMMAND_SECONDS)
-            e = compute_energy(cmd_file)
-            if e < app_state["energy_threshold"]:
-                messagebox.showwarning("Command", "Command too quiet. Try again.")
-                self.set_status("Idle")
-                return
-
-            self.set_status("Transcribing command...")
-            txt = transcribe_with_whisper(cmd_file)
-            self.set_status("Recognized: " + txt)
-            if not txt:
-                messagebox.showinfo("Command", "No speech transcribed.")
-                self.set_status("Idle")
-                return
-
-            ok2, info = execute_action_from_text(txt)
-            if ok2:
-                messagebox.showinfo("Action", f"Executed: {info}")
-            else:
-                messagebox.showinfo("Action", "No matching app/command found.")
-            self.set_status("Idle")
-
-        except Exception as e:
-            messagebox.showerror("Voice control error", str(e))
-            self.set_status("Idle")
-
-    def on_voice_to_text_page(self):
-        self.clear_page()
-        f = tk.Frame(self.page_frame, bg="#0b0f14")
-        f.pack(expand=True, fill="both", padx=20, pady=20)
-
-        title = tk.Label(f, text="Voice → Text", font=("Helvetica", 24), fg="white", bg="#0b0f14")
-        title.pack(pady=8)
-        instr = tk.Label(f, text="Click Record, speak, then press Transcribe.", fg="#bfcbd6", bg="#0b0f14")
-        instr.pack(pady=6)
-
-        # controls
-        btn_frame = tk.Frame(f, bg="#0b0f14")
-        btn_frame.pack(pady=8)
-        rec_btn = tk.Button(btn_frame, text="Record (4s)", command=lambda: self.v2t_record(TRANSCRIBE_SECONDS), bg="#2b6b33", fg="white")
-        rec_btn.grid(row=0, column=0, padx=6)
-        trans_btn = tk.Button(btn_frame, text="Transcribe", command=self.v2t_transcribe, bg="#1b65a5", fg="white")
-        trans_btn.grid(row=0, column=1, padx=6)
-        copy_btn = tk.Button(btn_frame, text="Copy Text", command=self.v2t_copy, bg="#6b6b6b", fg="white")
-        copy_btn.grid(row=0, column=2, padx=6)
-
-        # output text area
-        self.v2t_text = scrolledtext.ScrolledText(f, width=120, height=20, wrap=tk.WORD, font=("Arial", 14))
-        self.v2t_text.pack(pady=12)
-
-        back = tk.Button(f, text="Back", command=self.show_home, bg="#333333", fg="white")
-        back.pack(pady=8)
-
-        self.voice_text_page = f
-
-    @run_in_thread
-    def v2t_record(self, seconds):
-        try:
-            self.set_status("Recording for transcription...")
-            record_to_file("v2t.wav", seconds)
-            self.set_status("Recording complete.")
-        except Exception as e:
-            messagebox.showerror("Record error", str(e))
-            self.set_status("Idle")
-
-    @run_in_thread
-    def v2t_transcribe(self):
-        try:
-            if not os.path.exists("v2t.wav"):
-                messagebox.showwarning("No audio", "Please record first.")
-                return
-            self.set_status("Transcribing with Whisper...")
-            t = transcribe_with_whisper("v2t.wav")
-            self.v2t_text.delete("1.0", tk.END)
-            self.v2t_text.insert(tk.END, t)
-            self.set_status("Transcription complete.")
-        except Exception as e:
-            messagebox.showerror("Transcribe error", str(e))
-            self.set_status("Idle")
-
-    def v2t_copy(self):
-        txt = self.v2t_text.get("1.0", tk.END).strip()
-        if not txt:
-            messagebox.showinfo("Copy", "No text to copy.")
-            return
-        pyperclip.copy(txt)
-        messagebox.showinfo("Copy", "Text copied to clipboard.")
-
-# ---------------- run ----------------
-if __name__ == "__main__":
-    # quick safety checks
+@app.route('/api/enroll_owner', methods=['POST'])
+def api_enroll_owner():
     try:
-        root = tk.Tk()
-        app = EchoEdgeGUI(root)
-        root.mainloop()
+        enroll_owner_record(duration=6.0)
+        return jsonify({"status": "success", "message": "Owner enrolled successfully"})
     except Exception as e:
-        print("Fatal error:", e)
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/api/delete_owner', methods=['POST'])
+def api_delete_owner():
+    try:
+        if not os.path.exists(EMBED_PATH):
+            return jsonify({"status": "error", "message": "No owner enrolled"}), 400
+        delete_owner_embedding()
+        return jsonify({"status": "success", "message": "Owner data deleted"})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/api/update_threshold', methods=['POST'])
+def api_update_threshold():
+    try:
+        threshold = float(request.json.get('threshold'))
+        if not (0.5 <= threshold <= 0.99):
+            raise ValueError("Threshold must be between 0.5 and 0.99")
+        app_state["threshold"] = threshold
+        return jsonify({"status": "success", "message": f"Threshold updated to {threshold:.2f}"})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/api/update_energy_threshold', methods=['POST'])
+def api_update_energy_threshold():
+    try:
+        energy_threshold = float(request.json.get('energy_threshold'))
+        app_state["energy_threshold"] = energy_threshold
+        return jsonify({"status": "success", "message": f"Energy threshold updated to {energy_threshold:.6f}"})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/api/voice_control', methods=['POST'])
+def api_voice_control():
+    try:
+        # Verify owner
+        ok, sim = verify_owner_once(duration=VERIFY_SECONDS)
+        if sim is None:
+            return jsonify({"status": "error", "message": "No owner enrolled or audio too quiet"}), 400
+        
+        if not ok:
+            return jsonify({"status": "denied", "message": f"Access denied (similarity={sim:.3f})", "similarity": sim})
+        
+        # Record command
+        cmd_file = "web_command.wav"
+        record_to_file(cmd_file, COMMAND_SECONDS)
+        e = compute_energy(cmd_file)
+        if e < app_state["energy_threshold"]:
+            return jsonify({"status": "error", "message": "Command too quiet. Try again."}), 400
+        
+        # Transcribe command
+        txt = transcribe_with_whisper(cmd_file)
+        if not txt:
+            return jsonify({"status": "error", "message": "No speech transcribed"}), 400
+        
+        # Execute action
+        ok2, info = execute_action_from_text(txt)
+        if ok2:
+            return jsonify({
+                "status": "success", 
+                "message": f"Executed: {info}",
+                "transcription": txt,
+                "similarity": sim
+            })
+        else:
+            return jsonify({
+                "status": "no_match", 
+                "message": "No matching app/command found",
+                "transcription": txt,
+                "similarity": sim
+            })
+            
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/api/voice_to_text', methods=['POST'])
+def api_voice_to_text():
+    try:
+        # Record audio
+        v2t_file = "web_v2t.wav"
+        record_to_file(v2t_file, TRANSCRIBE_SECONDS)
+        
+        # Transcribe
+        txt = transcribe_with_whisper(v2t_file)
+        
+        return jsonify({
+            "status": "success", 
+            "transcription": txt
+        })
+            
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/api/status')
+def api_status():
+    return jsonify({
+        "app_state": app_state,
+        "owner_enrolled": os.path.exists(EMBED_PATH)
+    })
+
+def create_html_template():
+    """Create the HTML template with proper encoding"""
+    html_content = '''<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>EchoEdge Web</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #0b0f14;
+            color: white;
+            min-height: 100vh;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        
+        .header {
+            text-align: center;
+            padding: 20px 0;
+            border-bottom: 1px solid #1b2630;
+            margin-bottom: 30px;
+        }
+        
+        .header h1 {
+            font-size: 2.5rem;
+            color: white;
+            margin-bottom: 10px;
+        }
+        
+        .nav {
+            display: flex;
+            justify-content: center;
+            gap: 15px;
+            margin: 20px 0;
+            padding: 15px;
+            background: #081018;
+            border-radius: 10px;
+        }
+        
+        .nav button {
+            padding: 12px 24px;
+            background: #1b2630;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 16px;
+            transition: background 0.3s;
+        }
+        
+        .nav button:hover {
+            background: #2b3640;
+        }
+        
+        .nav button.quit {
+            background: #6b2222;
+        }
+        
+        .nav button.quit:hover {
+            background: #8b3232;
+        }
+        
+        .page {
+            display: none;
+            padding: 20px;
+        }
+        
+        .page.active {
+            display: block;
+        }
+        
+        .tile-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 30px;
+            margin: 30px 0;
+        }
+        
+        .tile {
+            background: #242a33;
+            padding: 40px 20px;
+            border-radius: 15px;
+            text-align: center;
+            cursor: pointer;
+            transition: transform 0.3s, background 0.3s;
+            min-height: 200px;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+        }
+        
+        .tile:hover {
+            transform: translateY(-5px);
+            background: #2b3640;
+        }
+        
+        .tile h2 {
+            font-size: 1.8rem;
+            margin-bottom: 15px;
+        }
+        
+        .tile p {
+            color: #bfcbd6;
+            font-size: 1.1rem;
+        }
+        
+        .settings-section {
+            background: #1b2630;
+            padding: 25px;
+            border-radius: 10px;
+            margin-bottom: 25px;
+            border: 1px solid #2b3640;
+        }
+        
+        .settings-section h3 {
+            color: white;
+            margin-bottom: 20px;
+            font-size: 1.4rem;
+            border-bottom: 1px solid #2b3640;
+            padding-bottom: 10px;
+        }
+        
+        .button-group {
+            display: flex;
+            gap: 15px;
+            flex-wrap: wrap;
+        }
+        
+        button {
+            padding: 12px 24px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 16px;
+            transition: background 0.3s;
+        }
+        
+        button.primary {
+            background: #2b6b33;
+            color: white;
+        }
+        
+        button.primary:hover {
+            background: #3b8b43;
+        }
+        
+        button.danger {
+            background: #6b2222;
+            color: white;
+        }
+        
+        button.danger:hover {
+            background: #8b3232;
+        }
+        
+        button.secondary {
+            background: #1b65a5;
+            color: white;
+        }
+        
+        button.secondary:hover {
+            background: #2b85c5;
+        }
+        
+        .form-group {
+            margin-bottom: 20px;
+        }
+        
+        .form-group label {
+            display: block;
+            margin-bottom: 8px;
+            color: #bfcbd6;
+        }
+        
+        .form-group input {
+            width: 200px;
+            padding: 10px;
+            border: 1px solid #2b3640;
+            border-radius: 5px;
+            background: #0b0f14;
+            color: white;
+            margin-right: 10px;
+        }
+        
+        .status-bar {
+            position: fixed;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            background: #061018;
+            padding: 15px;
+            border-top: 1px solid #1b2630;
+        }
+        
+        .status-text {
+            color: #bfcbd6;
+        }
+        
+        .transcription-box {
+            background: #0b0f14;
+            border: 1px solid #2b3640;
+            border-radius: 5px;
+            padding: 20px;
+            min-height: 300px;
+            color: white;
+            font-size: 16px;
+            line-height: 1.5;
+            margin: 20px 0;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }
+        
+        .alert {
+            padding: 15px;
+            border-radius: 5px;
+            margin: 15px 0;
+        }
+        
+        .alert.success {
+            background: #2b6b33;
+            color: white;
+        }
+        
+        .alert.error {
+            background: #6b2222;
+            color: white;
+        }
+        
+        .alert.warning {
+            background: #8b6b22;
+            color: white;
+        }
+        
+        .loading {
+            display: none;
+            text-align: center;
+            padding: 20px;
+            color: #bfcbd6;
+        }
+        
+        .spinner {
+            border: 4px solid #2b3640;
+            border-top: 4px solid #2b6b33;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 15px;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>EchoEdge</h1>
+            <p>Voice Control System</p>
+        </div>
+        
+        <div class="nav">
+            <button onclick="showPage('home')">Home</button>
+            <button onclick="showPage('settings')">Settings</button>
+            <button class="quit" onclick="window.close()">Quit</button>
+        </div>
+        
+        <!-- Home Page -->
+        <div id="home" class="page active">
+            <div class="tile-grid">
+                <div class="tile" onclick="voiceControl()">
+                    <h2>Voice Control Laptop</h2>
+                    <p>Owner-only voice commands to control your applications</p>
+                </div>
+                <div class="tile" onclick="showPage('voiceToText')">
+                    <h2>Voice to Text</h2>
+                    <p>Convert your speech to text and copy to clipboard</p>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Voice to Text Page -->
+        <div id="voiceToText" class="page">
+            <h2 style="text-align: center; margin-bottom: 20px;">Voice to Text</h2>
+            <p style="text-align: center; color: #bfcbd6; margin-bottom: 30px;">
+                Click Record, speak, then press Transcribe.
+            </p>
+            
+            <div style="text-align: center; margin-bottom: 30px;">
+                <button class="primary" onclick="recordForTranscription()">Record (6s)</button>
+                <button class="secondary" onclick="transcribeAudio()">Transcribe</button>
+                <button onclick="copyTranscription()">Copy Text</button>
+                <button onclick="showPage('home')" style="background: #333; color: white;">Back</button>
+            </div>
+            
+            <div class="transcription-box" id="transcriptionOutput">
+                Transcription will appear here...
+            </div>
+            
+            <div id="v2tLoading" class="loading">
+                <div class="spinner"></div>
+                <p>Processing...</p>
+            </div>
+        </div>
+        
+        <!-- Settings Page -->
+        <div id="settings" class="page">
+            <div class="settings-section">
+                <h3>Owner Voice (Enrollment)</h3>
+                <div class="button-group">
+                    <button class="primary" onclick="enrollOwner()">Enroll / Replace Owner</button>
+                    <button class="danger" onclick="deleteOwner()">Delete Owner</button>
+                </div>
+                <p style="color: #bfcbd6; margin-top: 15px; font-size: 14px;">
+                    Owner enrolled: <span id="ownerStatus">{{ "Yes" if owner_enrolled else "No" }}</span>
+                </p>
+            </div>
+            
+            <div class="settings-section">
+                <h3>Verification Settings</h3>
+                <div class="form-group">
+                    <label for="thresholdInput">Similarity threshold (0.5 - 0.99):</label>
+                    <input type="number" id="thresholdInput" step="0.01" min="0.5" max="0.99" value="{{ app_state.threshold }}">
+                    <button class="primary" onclick="updateThreshold()">Apply</button>
+                </div>
+                
+                <div class="form-group">
+                    <label for="energyInput">Energy sensitivity (lower = more sensitive):</label>
+                    <input type="number" id="energyInput" step="0.000001" min="0.000001" value="{{ app_state.energy_threshold }}">
+                    <button class="primary" onclick="updateEnergyThreshold()">Apply</button>
+                </div>
+            </div>
+            
+            <div style="color: #bfcbd6; padding: 20px; background: #0b0f14; border-radius: 5px;">
+                <p><strong>Notes:</strong> Enroll voice in quiet place. If verification fails, increase recording length in enroll step.</p>
+            </div>
+        </div>
+        
+        <!-- Alert Container -->
+        <div id="alertContainer" style="position: fixed; top: 20px; right: 20px; z-index: 1000;"></div>
+    </div>
+    
+    <div class="status-bar">
+        <div class="status-text" id="statusText">Idle</div>
+    </div>
+
+    <script>
+        let currentTranscription = '';
+        
+        function showPage(pageId) {
+            document.querySelectorAll('.page').forEach(page => {
+                page.classList.remove('active');
+            });
+            document.getElementById(pageId).classList.add('active');
+        }
+        
+        function setStatus(message) {
+            document.getElementById('statusText').textContent = message;
+        }
+        
+        function showAlert(message, type = 'info') {
+            const alertDiv = document.createElement('div');
+            alertDiv.className = `alert ${type}`;
+            alertDiv.textContent = message;
+            
+            const container = document.getElementById('alertContainer');
+            container.appendChild(alertDiv);
+            
+            setTimeout(() => {
+                alertDiv.remove();
+            }, 5000);
+        }
+        
+        function showLoading(show) {
+            document.getElementById('v2tLoading').style.display = show ? 'block' : 'none';
+        }
+        
+        async function enrollOwner() {
+            setStatus('Recording owner voice (6s)...');
+            try {
+                const response = await fetch('/api/enroll_owner', {
+                    method: 'POST'
+                });
+                const data = await response.json();
+                
+                if (data.status === 'success') {
+                    showAlert('Owner enrolled successfully', 'success');
+                    document.getElementById('ownerStatus').textContent = 'Yes';
+                } else {
+                    showAlert('Error: ' + data.message, 'error');
+                }
+            } catch (error) {
+                showAlert('Error: ' + error.message, 'error');
+            }
+            setStatus('Idle');
+        }
+        
+        async function deleteOwner() {
+            if (!confirm('Delete owner embedding and voice?')) return;
+            
+            try {
+                const response = await fetch('/api/delete_owner', {
+                    method: 'POST'
+                });
+                const data = await response.json();
+                
+                if (data.status === 'success') {
+                    showAlert('Owner data deleted', 'success');
+                    document.getElementById('ownerStatus').textContent = 'No';
+                } else {
+                    showAlert('Error: ' + data.message, 'error');
+                }
+            } catch (error) {
+                showAlert('Error: ' + error.message, 'error');
+            }
+        }
+        
+        async function updateThreshold() {
+            const threshold = parseFloat(document.getElementById('thresholdInput').value);
+            
+            try {
+                const response = await fetch('/api/update_threshold', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ threshold })
+                });
+                const data = await response.json();
+                
+                if (data.status === 'success') {
+                    showAlert(data.message, 'success');
+                } else {
+                    showAlert('Error: ' + data.message, 'error');
+                }
+            } catch (error) {
+                showAlert('Error: ' + error.message, 'error');
+            }
+        }
+        
+        async function updateEnergyThreshold() {
+            const energy_threshold = parseFloat(document.getElementById('energyInput').value);
+            
+            try {
+                const response = await fetch('/api/update_energy_threshold', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ energy_threshold })
+                });
+                const data = await response.json();
+                
+                if (data.status === 'success') {
+                    showAlert(data.message, 'success');
+                } else {
+                    showAlert('Error: ' + data.message, 'error');
+                }
+            } catch (error) {
+                showAlert('Error: ' + error.message, 'error');
+            }
+        }
+        
+        async function voiceControl() {
+            setStatus('Verifying owner voice...');
+            
+            try {
+                const response = await fetch('/api/voice_control', {
+                    method: 'POST'
+                });
+                const data = await response.json();
+                
+                if (data.status === 'success') {
+                    showAlert(`Action executed: ${data.message}`, 'success');
+                    setStatus(`Recognized: ${data.transcription}`);
+                } else if (data.status === 'denied') {
+                    showAlert(data.message, 'warning');
+                    setStatus(`Access denied (similarity: ${data.similarity.toFixed(3)})`);
+                } else if (data.status === 'no_match') {
+                    showAlert(data.message, 'warning');
+                    setStatus(`No match for: ${data.transcription}`);
+                } else {
+                    showAlert('Error: ' + data.message, 'error');
+                    setStatus('Idle');
+                }
+            } catch (error) {
+                showAlert('Error: ' + error.message, 'error');
+                setStatus('Idle');
+            }
+        }
+        
+        async function recordForTranscription() {
+            setStatus('Recording for transcription...');
+            showAlert('Recording... Speak now.', 'info');
+            
+            // In a real implementation, you'd use the Web Audio API
+            // For this demo, we'll simulate the recording
+            setTimeout(() => {
+                setStatus('Recording complete');
+                showAlert('Recording complete', 'success');
+            }, 6000);
+        }
+        
+        async function transcribeAudio() {
+            setStatus('Transcribing with Whisper...');
+            showLoading(true);
+            
+            try {
+                const response = await fetch('/api/voice_to_text', {
+                    method: 'POST'
+                });
+                const data = await response.json();
+                
+                if (data.status === 'success') {
+                    currentTranscription = data.transcription;
+                    document.getElementById('transcriptionOutput').textContent = data.transcription || 'No speech detected';
+                    showAlert('Transcription complete', 'success');
+                } else {
+                    showAlert('Error: ' + data.message, 'error');
+                }
+            } catch (error) {
+                showAlert('Error: ' + error.message, 'error');
+            }
+            
+            showLoading(false);
+            setStatus('Idle');
+        }
+        
+        function copyTranscription() {
+            if (!currentTranscription) {
+                showAlert('No text to copy', 'warning');
+                return;
+            }
+            
+            navigator.clipboard.writeText(currentTranscription).then(() => {
+                showAlert('Text copied to clipboard', 'success');
+            }).catch(() => {
+                showAlert('Failed to copy text', 'error');
+            });
+        }
+        
+        // Initialize
+        showPage('home');
+        setStatus('Ready');
+    </script>
+</body>
+</html>'''
+    return html_content
+
+if __name__ == '__main__':
+    # Create templates directory if it doesn't exist
+    os.makedirs('templates', exist_ok=True)
+    
+    # Create the HTML template with proper encoding
+    html_content = create_html_template()
+    with open('templates/index.html', 'w', encoding='utf-8') as f:
+        f.write(html_content)
+    
+    print("Starting EchoEdge Web Server...")
+    print("Access the application at: http://localhost:5000")
+    app.run(debug=True, host='0.0.0.0', port=5000)
+    
