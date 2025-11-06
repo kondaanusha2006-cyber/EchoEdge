@@ -1,0 +1,8 @@
+Flask
+sounddevice
+soundfile
+numpy
+torch
+torchaudio
+resemblyzer
+whisper
